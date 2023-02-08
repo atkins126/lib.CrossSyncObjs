@@ -13,11 +13,11 @@
     from libraries WinSynObjs and LinSyncObjs.
 
     Classes in WinSynObjs and LinSyncObjs are sticking to a nomenclature used
-    by system synchronization objects they are based on, as a result the
+    by system synchronization objects they are based upon, as a result the
     corresponding synchronizers in both libraries have differently named
     methods for the same functionality.
 
-    Wrappers in this library are hiding these differences behind a unified
+    Wrappers in this library are hiding these differences behind an unified
     interface. Note that only functionality common for both wrapped libraries
     is provided - specialities (eg. releasing a semaphore by more than 1,
     alertable waiting, ...) are not implemented or default value is used.
@@ -31,11 +31,11 @@
       WARNING - remembed that all system-specific limitations still apply here
                 (eg. max 64 events in WaitForMultipleEvents on Windows).
 
-  Version 1.0.1 (2022-08-05)
+  Version 1.1 (2022-12-26)
 
-  Last change 2022-08-05
+  Last change 2023-01-26
 
-  ©2022 František Milt
+  ©2022-2023 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -54,10 +54,12 @@
   Dependencies:
     AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
     AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+  * BinaryStreaming    - github.com/TheLazyTomcat/Lib.BinaryStreaming
     BitOps             - github.com/TheLazyTomcat/Lib.BitOps
   * BitVector          - github.com/TheLazyTomcat/Lib.BitVector
     HashBase           - github.com/TheLazyTomcat/Lib.HashBase
     InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
+  * LinSyncObjs        - github.com/TheLazyTomcat/Lib.LinSyncObjs
     NamedSharedItems   - github.com/TheLazyTomcat/Lib.NamedSharedItems
     SHA1               - github.com/TheLazyTomcat/Lib.SHA1
   * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
@@ -66,14 +68,16 @@
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
   * UInt64Utils        - github.com/TheLazyTomcat/Lib.UInt64Utils
+  * WinSyncObjs        - github.com/TheLazyTomcat/Lib.WinSyncObjs
 
-  Library UInt64Utils is required only when compiling for Windows OS.
+  Libraries UInt64Utils and WinSyncObjs are required only when compiling for
+  Windows OS.
 
-  Libraries BitVector and SimpleFutex are required only when compiling for
-  Linux OS.
+  Libraries BinaryStreaming, BitVector, LinSyncObjs and SimpleFutex are 
+  required only when compiling for Linux OS.
 
   Library SimpleCPUID might not be required when compiling for Windows OS,
-  depending on defined symbols in InterlockedOps and BitOps libraries.  
+  depending on defined symbols in InterlockedOps and BitOps libraries.
 
 ===============================================================================}
 unit CrossSyncObjs;
@@ -137,6 +141,8 @@ type
     procedure Unlock; virtual;
   end;
 
+  TCriticalSectionRTL = TRTLCriticalSection;
+
 {===============================================================================
 --------------------------------------------------------------------------------
                      TRTLMultiReadExclusiveWriteSynchronizer
@@ -158,7 +164,10 @@ type
     procedure WriteUnlock; virtual;
   end;
 
+  TMultiReadExclusiveWriteSynchronizerRTL = TRTLMultiReadExclusiveWriteSynchronizer;
+
   TRTLMREW = TRTLMultiReadExclusiveWriteSynchronizer;
+  TMREWRTL = TRTLMREW;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -304,9 +313,9 @@ type
     constructor Open(const Name: String{$IFNDEF FPC}; Dummy: Integer = 0{$ENDIF});
     constructor DuplicateFrom(Source: TReadWriteLock);
     destructor Destroy; override;
-    procedure ReadLock; virtual;
+    Function ReadLock(Timeout: UInt32 = INFINITE): TCSOWaitResult; virtual;
     procedure ReadUnlock; virtual;
-    procedure WriteLock; virtual;
+    Function WriteLock(Timeout: UInt32 = INFINITE): TCSOWaitResult; virtual;
     procedure WriteUnlock; virtual;
   end;
 
@@ -316,7 +325,7 @@ type
 --------------------------------------------------------------------------------
 ===============================================================================}
 type
-  TConditionVariableClass = class of {$IFDEF Windows}WinSyncObjs{$ELSE}LinSyncObjs{$ENDIF}.TConditionVariable;
+  TConditionVariableClass = class of TConditionVariable;  // original class from WinSyncObjs or LinSyncObjs
 
 type
   // types for autocycle
@@ -1014,12 +1023,23 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TReadWriteLock.ReadLock;
+Function TReadWriteLock.ReadLock(Timeout: UInt32 = INFINITE): TCSOWaitResult;
 begin
 {$IFDEF Windows}
-fSync.ReadLock;
+Result := TranslateWaitResult(fSync.ReadLock(Timeout));
 {$ELSE}
-fSync.ReadLockStrict;
+case Timeout of
+  0:        If fSync.TryReadLockStrict then
+              Result := wrSignaled
+            else
+              Result := wrTimeout;
+  INFINITE: begin
+              fSync.ReadLockStrict;
+              Result := wrSignaled;
+            end;
+else
+  Result := TranslateWaitResult(fSync.TimedReadLock(Timeout));
+end;
 {$ENDIF}
 end;
 
@@ -1036,12 +1056,24 @@ end;
  
 //------------------------------------------------------------------------------
 
-procedure TReadWriteLock.WriteLock;
+Function TReadWriteLock.WriteLock(Timeout: UInt32 = INFINITE): TCSOWaitResult;
 begin
 {$IFDEF Windows}
-fSync.WriteLock;
+Result := TranslateWaitResult(fSync.WriteLock(Timeout));
 {$ELSE}
 fSync.WriteLockStrict;
+case Timeout of
+  0:        If fSync.TryWriteLockStrict then
+              Result := wrSignaled
+            else
+              Result := wrTimeout;
+  INFINITE: begin
+              fSync.WriteLockStrict;
+              Result := wrSignaled;
+            end;
+else
+  Result := TranslateWaitResult(fSync.TimedWriteLock(Timeout));
+end;
 {$ENDIF}
 end;
 
@@ -1080,8 +1112,8 @@ end;
 procedure TConditionVariable.PredicateCheckHandler(Sender: TObject; var Predicate: Boolean);
 begin
 If Assigned(fOnPredicateCheckEvent) then
-  fOnPredicateCheckEvent(Self,Predicate);
-If Assigned(fOnPredicateCheckCallback) then
+  fOnPredicateCheckEvent(Self,Predicate)
+else If Assigned(fOnPredicateCheckCallback) then
   fOnPredicateCheckCallback(Self,Predicate);
 end;
 {$IFDEF FPCDWM}{$POP}{$ENDIF}
@@ -1095,8 +1127,8 @@ var
 begin
 WakeOptionsInternal := TranslateWakeOptions(WakeOptions);
 If Assigned(fOnDataAccessEvent) then
-  fOnDataAccessEvent(Self,WakeOptionsInternal);
-If Assigned(fOnDataAccessCallback) then
+  fOnDataAccessEvent(Self,WakeOptionsInternal)
+else If Assigned(fOnDataAccessCallback) then
   fOnDataAccessCallback(Self,WakeOptionsInternal);
 WakeOptions := TranslateWakeOptions(WakeOptionsInternal);
 end;
